@@ -2,7 +2,7 @@ venv/
 __pycache__/
 .ipynb_checkpoints/
 catboost_info/
-artifacts/
+
 assignment_outputs/
 assignment_support/
 auto_fraud_submission/
@@ -11,6 +11,11 @@ report_outputs/
 reports/
 src/
 notebooks/.ipynb_checkpoints/
+
+artifacts/*
+!artifacts/models/
+!artifacts/models/**
+
 *.docx
 *.html
 app_backup_before_mod10.py

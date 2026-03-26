@@ -4,8 +4,15 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import io
+import json
+import os
 from pathlib import Path
 from html import escape
+
+import joblib
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
@@ -842,6 +849,11 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH_EVENTS = BASE_DIR / "data" / "processed" / "meps_group6_analysis_ready_events.parquet"
 DATA_PATH_BASE = BASE_DIR / "data" / "processed" / "meps_group6_analysis_ready.parquet"
 DATA_PATH = DATA_PATH_EVENTS if DATA_PATH_EVENTS.exists() else DATA_PATH_BASE
+ARTIFACT_DIR = BASE_DIR / "artifacts" / "models"
+ARTIFACT_MANIFEST_PATH = ARTIFACT_DIR / "model_metadata.json"
+ARTIFACT_FEATURES_PATH = ARTIFACT_DIR / "feature_columns.json"
+ARTIFACT_CATS_PATH = ARTIFACT_DIR / "categorical_columns.json"
+ARTIFACT_METRICS_PATH = ARTIFACT_DIR / "model_metrics.csv"
 NEG_CODES = [-1, -7, -8, -9]
 RANDOM_STATE = 42
 
@@ -1010,6 +1022,132 @@ def compute_lift_table(y_true_binary, scores):
     return lift_table, base_rate
 
 
+def model_artifact_paths(model_name):
+    safe_name = model_name.lower()
+    paths = {
+        "bundle": ARTIFACT_DIR / f"{safe_name}_bundle.joblib",
+    }
+    if model_name == "CatBoost":
+        paths["model"] = ARTIFACT_DIR / "catboost_model.cbm"
+    return paths
+
+
+def artifacts_usable(uploaded_bytes, feature_cols, holdout_panel, train_panels, model_names):
+    if uploaded_bytes is not None:
+        return False, "Uploaded parquet selected; using on-the-fly training."
+    if not ARTIFACT_MANIFEST_PATH.exists():
+        return False, "Saved model metadata not found."
+    try:
+        manifest = json.loads(ARTIFACT_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return False, "Saved model metadata could not be read."
+
+    required_paths = [ARTIFACT_FEATURES_PATH, ARTIFACT_CATS_PATH]
+    for name in model_names:
+        paths = model_artifact_paths(name)
+        required_paths.append(paths["bundle"])
+        if name == "CatBoost":
+            required_paths.append(paths["model"])
+    missing = [p.name for p in required_paths if not p.exists()]
+    if missing:
+        return False, f"Missing saved artifact files: {', '.join(missing)}."
+
+    manifest_features = manifest.get("feature_columns", [])
+    if manifest_features != list(feature_cols):
+        return False, "Saved model feature schema does not match the current project dataset."
+    if int(manifest.get("holdout_panel", -1)) != int(holdout_panel):
+        return False, "Saved model holdout panel does not match the current project dataset."
+    if [int(p) for p in manifest.get("train_panels", [])] != [int(p) for p in train_panels]:
+        return False, "Saved model training panels do not match the current project dataset."
+    return True, manifest
+
+
+def prepare_baseline_frame_from_artifact(X_input, bundle):
+    X_prepped = X_input.copy()
+    num_fill_values = bundle["num_fill_values"]
+    cat_cols = bundle["cat_cols"]
+
+    for col, value in num_fill_values.items():
+        if col not in X_prepped.columns:
+            X_prepped[col] = value
+        X_prepped[col] = X_prepped[col].fillna(value)
+
+    for col in cat_cols:
+        if col not in X_prepped.columns:
+            X_prepped[col] = "NA"
+        X_prepped[col] = X_prepped[col].astype("string").fillna("NA")
+
+    if cat_cols:
+        X_prepped = pd.get_dummies(X_prepped, columns=cat_cols, dummy_na=False)
+
+    feature_columns = bundle["feature_columns"]
+    X_prepped = X_prepped.reindex(columns=feature_columns, fill_value=0)
+    return X_prepped
+
+
+def prepare_catboost_frame_from_artifact(X_input, bundle):
+    X_prepped = X_input.copy()
+    num_fill_values = bundle["num_fill_values"]
+    cat_cols = bundle["cat_cols"]
+    feature_order = bundle["feature_order"]
+
+    for col, value in num_fill_values.items():
+        if col not in X_prepped.columns:
+            X_prepped[col] = value
+        X_prepped[col] = X_prepped[col].fillna(value)
+
+    for col in cat_cols:
+        if col not in X_prepped.columns:
+            X_prepped[col] = "NA"
+        X_prepped[col] = X_prepped[col].astype("string").fillna("NA")
+
+    X_prepped = X_prepped.reindex(columns=feature_order)
+    cat_idx = [feature_order.index(c) for c in cat_cols]
+    return X_prepped, cat_idx
+
+
+def evaluate_model_outputs(name, y_test, y_pred, y_proba):
+    y_test_bin = (y_test == 2).astype(int)
+    recall_class2 = recall_score(y_test_bin, (y_pred == 2).astype(int), zero_division=0)
+    pr_auc_class2 = average_precision_score(y_test_bin, y_proba[:, 2])
+    lift_table, base_rate = compute_lift_table(y_test_bin, y_proba[:, 2])
+    top_decile_lift = float(lift_table.loc[0, "lift"]) if not lift_table.empty else np.nan
+    frac_pos, mean_pred = calibration_curve(y_test_bin, y_proba[:, 2], n_bins=10)
+    precision_curve, recall_curve, _ = precision_recall_curve(y_test_bin, y_proba[:, 2])
+
+    row = {
+        "Model": name,
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Balanced Accuracy": balanced_accuracy_score(y_test, y_pred),
+        "Macro-F1": f1_score(y_test, y_pred, average="macro", zero_division=0),
+        "Recall (2+)": recall_class2,
+        "PR-AUC (2+)": pr_auc_class2,
+        "Top-Decile Lift": top_decile_lift,
+    }
+    diag = {
+        "precision_curve": precision_curve,
+        "recall_curve": recall_curve,
+        "frac_pos": frac_pos,
+        "mean_pred": mean_pred,
+        "lift_table": lift_table,
+        "base_rate": base_rate,
+    }
+    return row, diag
+
+
+def build_results_bundle(preds, probas, y_test, meta_test, pred_pct):
+    results = []
+    diagnostics = {}
+    for name, y_pred in preds.items():
+        row, diag = evaluate_model_outputs(name, y_test, y_pred, probas[name])
+        results.append(row)
+        diagnostics[name] = diag
+
+    results_df = pd.DataFrame(results).sort_values("PR-AUC (2+)", ascending=False).reset_index(drop=True)
+    pred_df, score_cols, flag_cols = build_prediction_table(meta_test, probas, pred_pct)
+    return results_df, diagnostics, pred_df, score_cols, flag_cols
+
+
 @st.cache_data(show_spinner=False)
 def train_and_eval(X, y, panels, meta, model_names, pred_pct):
     unique_panels = sorted(int(p) for p in panels.dropna().unique())
@@ -1056,10 +1194,8 @@ def train_and_eval(X, y, panels, meta, model_names, pred_pct):
             n_jobs=-1,
         )
 
-    results = []
     preds = {}
     probas = {}
-    diagnostics = {}
 
     for name, model in models.items():
         if name == "CatBoost":
@@ -1074,35 +1210,48 @@ def train_and_eval(X, y, panels, meta, model_names, pred_pct):
         preds[name] = y_pred
         probas[name] = y_proba
 
-        y_test_bin = (y_test == 2).astype(int)
-        recall_class2 = recall_score(y_test_bin, (y_pred == 2).astype(int), zero_division=0)
-        pr_auc_class2 = average_precision_score(y_test_bin, y_proba[:, 2])
-        lift_table, base_rate = compute_lift_table(y_test_bin, y_proba[:, 2])
-        top_decile_lift = float(lift_table.loc[0, "lift"]) if not lift_table.empty else np.nan
-        frac_pos, mean_pred = calibration_curve(y_test_bin, y_proba[:, 2], n_bins=10)
-        precision_curve, recall_curve, _ = precision_recall_curve(y_test_bin, y_proba[:, 2])
+    results_df, diagnostics, pred_df, score_cols, flag_cols = build_results_bundle(
+        preds, probas, y_test, meta_test, pred_pct
+    )
+    return results_df, preds, probas, y_test, diagnostics, pred_df, score_cols, flag_cols
 
-        results.append({
-            "Model": name,
-            "Accuracy": accuracy_score(y_test, y_pred),
-            "Balanced Accuracy": balanced_accuracy_score(y_test, y_pred),
-            "Macro-F1": f1_score(y_test, y_pred, average="macro", zero_division=0),
-            "Recall (2+)": recall_class2,
-            "PR-AUC (2+)": pr_auc_class2,
-            "Top-Decile Lift": top_decile_lift,
-        })
 
-        diagnostics[name] = {
-            "precision_curve": precision_curve,
-            "recall_curve": recall_curve,
-            "frac_pos": frac_pos,
-            "mean_pred": mean_pred,
-            "lift_table": lift_table,
-            "base_rate": base_rate,
-        }
+@st.cache_data(show_spinner=False)
+def load_and_eval_artifacts(X, y, panels, meta, model_names, pred_pct):
+    holdout_panel = int(max(sorted(int(p) for p in panels.dropna().unique())))
+    test_idx = panels.isin([holdout_panel])
 
-    results_df = pd.DataFrame(results).sort_values("PR-AUC (2+)", ascending=False).reset_index(drop=True)
-    pred_df, score_cols, flag_cols = build_prediction_table(meta_test, probas, pred_pct)
+    X_test = X.loc[test_idx].copy()
+    y_test = y.loc[test_idx].copy()
+    meta_test = meta.loc[test_idx].reset_index(drop=True).copy()
+
+    preds = {}
+    probas = {}
+
+    for name in model_names:
+        paths = model_artifact_paths(name)
+        bundle = joblib.load(paths["bundle"])
+
+        if name == "CatBoost":
+            if CatBoostClassifier is None:
+                raise RuntimeError("CatBoost is not installed, so the saved CatBoost artifact cannot be loaded.")
+            model = CatBoostClassifier()
+            model.load_model(str(paths["model"]))
+            X_eval, _ = prepare_catboost_frame_from_artifact(X_test, bundle)
+            y_pred = np.asarray(model.predict(X_eval)).astype(int).flatten()
+            y_proba = model.predict_proba(X_eval)
+        else:
+            model = bundle["model"]
+            X_eval = prepare_baseline_frame_from_artifact(X_test, bundle)
+            y_pred = model.predict(X_eval)
+            y_proba = model.predict_proba(X_eval)
+
+        preds[name] = y_pred
+        probas[name] = y_proba
+
+    results_df, diagnostics, pred_df, score_cols, flag_cols = build_results_bundle(
+        preds, probas, y_test, meta_test, pred_pct
+    )
     return results_df, preds, probas, y_test, diagnostics, pred_df, score_cols, flag_cols
 
 
@@ -1271,6 +1420,13 @@ train_panels = [p for p in panel_values if p != holdout_panel]
 holdout_mask = panels.isin([holdout_panel])
 holdout_n = int(holdout_mask.sum())
 holdout_rate = float((y.loc[holdout_mask] == 2).mean())
+saved_artifacts_ready, artifact_info = artifacts_usable(
+    uploaded_bytes,
+    feature_cols,
+    holdout_panel,
+    train_panels,
+    model_choices if model_choices else [],
+)
 panel_label = f"Group 6 / Panels {min(panel_values)}-{max(panel_values)} / 2018-2023"
 
 st.markdown(
@@ -1382,23 +1538,56 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if saved_artifacts_ready:
+    st.markdown(
+        "<div class='small-muted'>Saved model artifacts are available for the selected models. "
+        "Run analysis will load artifacts instead of retraining.</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f"<div class='small-muted'>{escape(str(artifact_info))}</div>",
+        unsafe_allow_html=True,
+    )
+
+if st.session_state.get("analysis_source") == "saved_artifacts":
+    st.markdown(
+        "<div class='small-muted'>Latest analysis loaded the saved model bundle from the project artifacts directory.</div>",
+        unsafe_allow_html=True,
+    )
+elif st.session_state.get("analysis_source") == "runtime_training":
+    st.markdown(
+        "<div class='small-muted'>Latest analysis retrained the selected models during this session.</div>",
+        unsafe_allow_html=True,
+    )
+
 # Run analysis on submit
 if run_btn:
     if not model_choices:
         st.warning("Please select at least one model.")
     else:
-        with st.spinner("Training panel-validated models..."):
-            results_df, preds, probas, y_test, diagnostics, pred_df, score_cols, flag_cols = train_and_eval(
+        if saved_artifacts_ready:
+            spinner_text = "Loading saved model artifacts..."
+            runner = load_and_eval_artifacts
+            analysis_source = "saved_artifacts"
+        else:
+            spinner_text = "Training panel-validated models..."
+            runner = train_and_eval
+            analysis_source = "runtime_training"
+
+        with st.spinner(spinner_text):
+            results_df, preds, probas, y_test, diagnostics, pred_df, score_cols, flag_cols = runner(
                 X, y, panels, meta, model_choices, pred_pct
             )
-            st.session_state["results_df"] = results_df
-            st.session_state["preds"] = preds
-            st.session_state["probas"] = probas
-            st.session_state["y_test"] = y_test
-            st.session_state["diagnostics"] = diagnostics
-            st.session_state["pred_df"] = pred_df
-            st.session_state["score_cols"] = score_cols
-            st.session_state["flag_cols"] = flag_cols
+        st.session_state["results_df"] = results_df
+        st.session_state["preds"] = preds
+        st.session_state["probas"] = probas
+        st.session_state["y_test"] = y_test
+        st.session_state["diagnostics"] = diagnostics
+        st.session_state["pred_df"] = pred_df
+        st.session_state["score_cols"] = score_cols
+        st.session_state["flag_cols"] = flag_cols
+        st.session_state["analysis_source"] = analysis_source
 
 # Predicted cohort section (collapsible via toggle)
 show_pred = render_toggle_row(
